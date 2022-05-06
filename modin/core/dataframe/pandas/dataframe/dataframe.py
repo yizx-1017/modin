@@ -1584,6 +1584,85 @@ class PandasDataframe(object):
         """
         pass
 
+    def compute_formula(
+        self,
+        formula_fn: Callable,
+        references: list, 
+        reference_types: list,
+    ) -> "PandasDataframe":
+        num_parts = len(self._partitions)
+        results = []
+        window_size = 0
+        for ref in references:
+            if isinstance(ref[0], tuple):
+                window_size = max(window_size, max(ref[0][1], ref[1][1]))
+            else:
+                window_size = max(window_size, ref[1])
+
+        def formula_fuction_partition(virtual_partition, references, last=False):
+            numRows = len(virtual_partition)
+            numCols = 1
+            if last:
+                n = numRows
+                virtual_column = pandas.DataFrame(index=virtual_partition.index,columns=range(numCols))
+            else:
+                n = numRows - window_size + 1
+                virtual_column = pandas.DataFrame(index=virtual_partition.index[0:n],columns=range(numCols))
+            
+            for i in range(0, n):
+                window = virtual_partition.iloc[i : i + window_size, :]
+                ref = references[0]
+                values = []
+                for ref in references:
+                    if isinstance(ref[0], tuple):
+                        value = window.iloc[ref[0][1]-1:ref[1][1], ref[0][0]-1:ref[1][0]].values.tolist()
+                    else:
+                        value = window.iloc[ref[1]-1, ref[0]-1]
+                    values.append(value)
+                reduction_result = formula_fn(*values)
+                virtual_column.iloc[i] = reduction_result
+            return virtual_column
+
+        for i in range(num_parts):
+            parts_to_join = []
+            starting_part = self._partitions[i][0]
+            parts_to_join.append([starting_part])
+            last_window_span = window_size - 1
+            k = i + 1
+            last_part = False
+
+            while (last_window_span > 0 and k < num_parts):
+                new_part = self._partitions[k][0]
+                part_len = new_part.length()
+                if (k == (num_parts - 1)):
+                    # end of the partitions
+                    last_part = True
+                    parts_to_join.append([new_part])
+                    break
+                
+                if (last_window_span > part_len):
+                    parts_to_join.append([new_part])
+                    last_window_span -= part_len
+                    k += 1
+                else:
+                    masked_new_part = new_part.mask(row_labels = slice(0, last_window_span), col_labels=slice(None))
+                    parts_to_join.append([masked_new_part])
+                    break
+            virtual_partitions = self._partition_mgr_cls.column_partitions(np.array(parts_to_join), full_axis=False)
+            result = [virtual_partition.apply(formula_fuction_partition, references = references, last=last_part) for virtual_partition in virtual_partitions]
+            results.append(result)
+
+            if last_part:
+                break
+        
+        return self.__constructor__(
+            results,
+            self.index,
+            ['col'],
+            self._row_lengths,
+            [1]
+        )
+
     @lazy_metadata_decorator(apply_axis="both")
     def fold(self, axis, func):
         """
